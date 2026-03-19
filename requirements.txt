@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]
 supabase
 anthropic
 python-dotenv
+psycopg2-binary
