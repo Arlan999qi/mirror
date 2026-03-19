@@ -29,20 +29,18 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOPICS = ["career", "relationships", "health", "education",
           "emotions", "finance", "daily_life", "goals"]
 
-
-def _recency_weight(entry_date):
-    """Calculate temporal weight: recent entries matter more."""
-    days_ago = (date.today() - entry_date).days
-    if days_ago <= 30:
-        return 1.0
-    elif days_ago <= 90:
-        return 0.7
-    elif days_ago <= 180:
-        return 0.4
-    elif days_ago <= 365:
-        return 0.2
-    else:
-        return 0.1
+# Default config values (used when bot_config table is unavailable)
+_DEFAULT_CONFIG = {
+    "recency_weights": {"30": 1.0, "90": 0.7, "180": 0.4, "365": 0.2, "inf": 0.1},
+    "topics": TOPICS,
+    "importance_criteria": (
+        "1-3: routine activities, weather, what I ate, small tasks. "
+        "4-6: reflections on work, relationship dynamics, health changes, moderate decisions. "
+        "7-8: significant realizations, major decisions, emotional breakthroughs. "
+        "9-10: life-changing events, core identity shifts, fundamental belief changes."
+    ),
+    "rebuild_limit": 500,
+}
 
 
 class MirrorMemory:
@@ -52,6 +50,7 @@ class MirrorMemory:
         self.dry_run = dry_run
         self.sb = None
         self._fallback_db = None
+        self._config_cache = {}
 
         if dry_run:
             self._init_sqlite()
@@ -99,11 +98,102 @@ class MirrorMemory:
     def _using_sqlite(self):
         return self.sb is None
 
+    # -- Config System --------------------------------------------------------
+
+    def load_config(self, key):
+        """Load a config value from bot_config table. Falls back to defaults."""
+        if key in self._config_cache:
+            return self._config_cache[key]
+
+        if self._using_sqlite:
+            value = _DEFAULT_CONFIG.get(key)
+            if value is not None:
+                self._config_cache[key] = value
+            return value
+
+        try:
+            result = (self.sb.table("bot_config")
+                      .select("value")
+                      .eq("key", key)
+                      .execute())
+            if result.data:
+                value = result.data[0]["value"]
+                self._config_cache[key] = value
+                return value
+        except Exception as e:
+            logger.error("Failed to load config '%s': %s", key, e)
+
+        # Fall back to default
+        value = _DEFAULT_CONFIG.get(key)
+        if value is not None:
+            self._config_cache[key] = value
+        return value
+
+    def save_config(self, key, value, updated_by="system"):
+        """Upsert a config value into bot_config table. Clears cache."""
+        self._config_cache.pop(key, None)
+        if self._using_sqlite:
+            return False
+        try:
+            self.sb.table("bot_config").upsert({
+                "key": key,
+                "value": value,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_by": updated_by,
+            }, on_conflict="key").execute()
+            logger.info("Config '%s' updated by %s", key, updated_by)
+            return True
+        except Exception as e:
+            logger.error("Failed to save config '%s': %s", key, e)
+            return False
+
+    def apply_config_change(self, change):
+        """Apply an approved self-improvement change to bot_config.
+
+        Args:
+            change: dict with 'config_key', 'proposed_value', 'id' fields.
+        Returns:
+            True if applied successfully.
+        """
+        config_key = change.get("config_key")
+        proposed_value = change.get("proposed_value")
+        change_id = change.get("id", "unknown")
+
+        if not config_key or proposed_value is None:
+            logger.error("Invalid config change: missing config_key or proposed_value")
+            return False
+
+        return self.save_config(config_key, proposed_value, updated_by=f"self_review_{change_id}")
+
+    def get_topics(self):
+        """Get topic list from config, falling back to module-level TOPICS."""
+        return self.load_config("topics") or TOPICS
+
+    def _recency_weight(self, entry_date):
+        """Calculate temporal weight using config-driven thresholds."""
+        if isinstance(entry_date, str):
+            entry_date = date.fromisoformat(entry_date)
+        days_ago = (date.today() - entry_date).days
+        weights = self.load_config("recency_weights") or _DEFAULT_CONFIG["recency_weights"]
+        # Sort thresholds numerically (skip "inf")
+        thresholds = []
+        inf_weight = 0.1
+        for k, v in weights.items():
+            if k == "inf":
+                inf_weight = v
+            else:
+                thresholds.append((int(k), v))
+        thresholds.sort()
+        for threshold, weight in thresholds:
+            if days_ago <= threshold:
+                return weight
+        return inf_weight
+
     def save_entry(self, content, entry_date, entry_type="text",
                    telegram_message_id=None, topics=None, importance=5,
                    metadata=None):
         """Save a journal entry. Returns entry ID or None on failure."""
-        weight = _recency_weight(entry_date)
+        weight = self._recency_weight(entry_date)
         topics = topics or []
         metadata = metadata or {}
 
@@ -275,6 +365,64 @@ class MirrorMemory:
             logger.error("Failed to get recent entries: %s", e)
             return []
 
+    def get_entries_by_date(self, target_date):
+        """Get all entries from a specific date."""
+        if isinstance(target_date, str):
+            target_date = date.fromisoformat(target_date)
+        date_str = target_date.isoformat()
+
+        if self._using_sqlite:
+            try:
+                cur = self._fallback_db.execute(
+                    "SELECT * FROM entries WHERE entry_date = ? ORDER BY created_at",
+                    (date_str,)
+                )
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+            except Exception as e:
+                logger.error("SQLite date query failed: %s", e)
+                return []
+        try:
+            result = (self.sb.table("entries")
+                      .select("*")
+                      .eq("entry_date", date_str)
+                      .order("created_at")
+                      .execute())
+            return result.data or []
+        except Exception as e:
+            logger.error("Failed to get entries by date: %s", e)
+            return []
+
+    def get_entries_in_range(self, start_date, end_date):
+        """Get entries between two dates (inclusive)."""
+        if isinstance(start_date, str):
+            start_date = date.fromisoformat(start_date)
+        if isinstance(end_date, str):
+            end_date = date.fromisoformat(end_date)
+
+        if self._using_sqlite:
+            try:
+                cur = self._fallback_db.execute(
+                    "SELECT * FROM entries WHERE entry_date BETWEEN ? AND ? ORDER BY entry_date",
+                    (start_date.isoformat(), end_date.isoformat())
+                )
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+            except Exception as e:
+                logger.error("SQLite range query failed: %s", e)
+                return []
+        try:
+            result = (self.sb.table("entries")
+                      .select("*")
+                      .gte("entry_date", start_date.isoformat())
+                      .lte("entry_date", end_date.isoformat())
+                      .order("entry_date")
+                      .execute())
+            return result.data or []
+        except Exception as e:
+            logger.error("Failed to get entries in range: %s", e)
+            return []
+
     def get_entry_count(self):
         """Get total number of entries."""
         if self._using_sqlite:
@@ -395,8 +543,10 @@ class MirrorMemory:
 
     # -- Profile Rebuild --------------------------------------------------
 
-    def get_all_entries_for_rebuild(self, limit=500):
+    def get_all_entries_for_rebuild(self, limit=None):
         """Get all entries ordered by date descending, for profile rebuild."""
+        if limit is None:
+            limit = self.load_config("rebuild_limit") or 500
         if self._using_sqlite:
             try:
                 cur = self._fallback_db.execute(
@@ -453,6 +603,14 @@ class MirrorMemory:
         if not entries:
             logger.warning("No entries found for profile rebuild")
             return None
+
+        # Recalculate recency weights based on current date
+        for e in entries:
+            ed = e.get("entry_date")
+            if ed:
+                if isinstance(ed, str):
+                    ed = date.fromisoformat(ed)
+                e["recency_weight"] = self._recency_weight(ed)
 
         formatted = self._format_entries_for_prompt(entries)
         prompt = PROFILE_REBUILD_PROMPT.format(entries=formatted)
@@ -514,8 +672,16 @@ class MirrorMemory:
             logger.warning("No entries for topic rebuild")
             return {}
 
+        # Recalculate recency weights based on current date
+        for e in all_entries:
+            ed = e.get("entry_date")
+            if ed:
+                if isinstance(ed, str):
+                    ed = date.fromisoformat(ed)
+                e["recency_weight"] = self._recency_weight(ed)
+
         results = {}
-        for topic in TOPICS:
+        for topic in self.get_topics():
             # Filter entries that include this topic
             topic_entries = []
             for e in all_entries:
@@ -601,6 +767,47 @@ class MirrorMemory:
             return 0
 
     # -- Self-Improvement Loop --------------------------------------------
+
+    def get_topic_entry_counts(self):
+        """Get entry count per topic. Returns {topic: count}."""
+        if self._using_sqlite:
+            return {}
+        try:
+            result = self.sb.rpc("get_topic_counts", {}).execute()
+            if result.data:
+                return {row["topic"]: row["count"] for row in result.data}
+        except Exception:
+            pass
+        # Fallback: count manually from recent entries
+        try:
+            entries = self.get_all_entries_for_rebuild()
+            counts = {}
+            for e in entries:
+                topics = e.get("topics", [])
+                if isinstance(topics, str):
+                    try:
+                        topics = json.loads(topics)
+                    except (json.JSONDecodeError, TypeError):
+                        topics = []
+                for t in topics:
+                    counts[t] = counts.get(t, 0) + 1
+            return counts
+        except Exception as e:
+            logger.error("Failed to get topic counts: %s", e)
+            return {}
+
+    def _get_config_summary(self):
+        """Build a text summary of current config values for prompts."""
+        weights = self.load_config("recency_weights")
+        topics = self.get_topics()
+        criteria = self.load_config("importance_criteria")
+        rebuild_limit = self.load_config("rebuild_limit")
+        return (
+            f"Recency weights: {json.dumps(weights)}\n"
+            f"Topics: {json.dumps(topics)}\n"
+            f"Importance criteria: {criteria}\n"
+            f"Rebuild limit: {rebuild_limit}"
+        )
 
     def get_usage_range(self, start_date, end_date):
         """Get usage tracking rows for a date range. Returns list of dicts."""
@@ -699,6 +906,7 @@ class MirrorMemory:
             usage_data=usage_data,
             ratings_summary=ratings_summary,
             error_summary=error_summary,
+            config_summary=self._get_config_summary(),
         )
 
         try:
@@ -722,10 +930,21 @@ class MirrorMemory:
                 cost_cents=cost_cents,
             )
 
+            # Parse suggestions JSON from review text
+            suggestions = []
+            try:
+                # Look for JSON array in the response
+                import re
+                json_match = re.search(r'\[[\s\S]*?\]', review_text)
+                if json_match:
+                    suggestions = json.loads(json_match.group())
+            except (json.JSONDecodeError, TypeError):
+                pass
+
             # Save to self_reviews
-            self.save_self_review(week_start, review_text, suggestions=[])
-            logger.info("Weekly self-review saved (week of %s)", week_start)
-            return review_text, []
+            self.save_self_review(week_start, review_text, suggestions=suggestions)
+            logger.info("Weekly self-review saved (week of %s), %d suggestions", week_start, len(suggestions))
+            return review_text, suggestions
 
         except Exception as e:
             logger.error("Weekly self-review failed: %s", e)
@@ -733,21 +952,21 @@ class MirrorMemory:
             return None, None
 
     def run_monthly_improvement(self, claude_client=None):
-        """Synthesize past month's weekly reviews into improvement suggestions.
+        """Synthesize past month's data into structured improvement proposals.
 
-        Returns improvement text or None on failure.
+        Returns (summary_text, proposals_list) or (None, None) on failure.
         """
         if claude_client is None:
             api_key = os.getenv("ANTHROPIC_API_KEY")
             if not api_key:
                 logger.error("No Anthropic API key for monthly improvement")
-                return None
+                return None, None
             claude_client = anthropic.Anthropic(api_key=api_key)
 
         reviews = self.get_recent_self_reviews(limit=4)
         if not reviews:
             logger.info("No self-reviews for monthly improvement")
-            return None
+            return None, None
 
         reviews_text = "\n\n---\n\n".join(
             f"Week of {r['week_start']}:\n{r['review_text']}" for r in reviews
@@ -759,21 +978,41 @@ class MirrorMemory:
         usage_rows = self.get_usage_range(month_start, today)
         total_cost = sum(float(r.get("estimated_cost_cents", 0)) for r in usage_rows)
         total_entries = sum(r.get("entries_count", 0) for r in usage_rows)
+        total_ai_calls = sum(r.get("ai_calls_count", 0) for r in usage_rows)
+        total_cache = sum(r.get("cache_read_tokens", 0) for r in usage_rows)
+        total_pos = sum(r.get("ratings_positive", 0) for r in usage_rows)
+        total_neg = sum(r.get("ratings_negative", 0) for r in usage_rows)
         monthly_usage = (
             f"Period: {month_start} to {today}\n"
             f"Total entries: {total_entries}\n"
+            f"AI calls: {total_ai_calls}\n"
+            f"Cache read tokens: {total_cache:,}\n"
+            f"Ratings: {total_pos} positive, {total_neg} negative\n"
             f"Total cost: ${total_cost / 100:.4f}"
         )
+
+        # Gather context
+        topic_counts = self.get_topic_entry_counts()
+        topic_summaries = self.load_all_topics()
+        recent = self.get_recent_entries(limit=20)
+
+        topic_counts_text = "\n".join(f"  {t}: {c} entries" for t, c in sorted(topic_counts.items(), key=lambda x: -x[1])) or "No data"
+        topic_summaries_text = "\n\n".join(f"=== {t.upper()} ===\n{s}" for t, s in topic_summaries.items()) or "No summaries yet"
+        recent_text = self._format_entries_for_prompt(recent) if recent else "No recent entries"
 
         prompt = MONTHLY_IMPROVEMENT_PROMPT.format(
             reviews=reviews_text,
             monthly_usage=monthly_usage,
+            config_summary=self._get_config_summary(),
+            topic_counts=topic_counts_text,
+            topic_summaries=topic_summaries_text,
+            recent_entries=recent_text,
         )
 
         try:
             response = claude_client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=800,
+                max_tokens=1500,
                 system=MIRROR_SYSTEM,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -791,10 +1030,25 @@ class MirrorMemory:
                 cost_cents=cost_cents,
             )
 
-            logger.info("Monthly improvement summary generated")
-            return text
+            # Parse structured JSON response
+            import re
+            proposals = []
+            summary = ""
+            try:
+                # Try to find JSON object in response
+                json_match = re.search(r'\{[\s\S]*\}', text)
+                if json_match:
+                    parsed = json.loads(json_match.group())
+                    proposals = parsed.get("proposed_changes", [])
+                    summary = parsed.get("summary", "")
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning("Failed to parse monthly improvement JSON: %s", e)
+                summary = text  # Fall back to raw text
+
+            logger.info("Monthly improvement: %d proposals generated", len(proposals))
+            return summary, proposals
 
         except Exception as e:
             logger.error("Monthly improvement failed: %s", e)
             self.track_usage(is_error=True)
-            return None
+            return None, None

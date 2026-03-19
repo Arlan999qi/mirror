@@ -11,10 +11,12 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
 import logging
 import os
 import re
+import signal
 import sys
 from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo
@@ -34,13 +36,14 @@ from telegram.ext import (
 from mirror_memory import MirrorMemory, PROJECT_ROOT
 from mirror_prompts import (
     TAGGING_PROMPT, QUESTION_PROMPT, MIRROR_SYSTEM,
-    FEEDBACK_PROMPT, INSIGHT_PROMPT, REPORT_PROMPT,
+    FEEDBACK_PROMPT, INSIGHT_PROMPT, REPORT_PROMPT, RECALL_PROMPT,
     ONBOARDING_INTRO, ONBOARDING_QUESTIONS, PROFILE_DISPLAY_PROMPT,
-    make_tagging_message, build_context,
+    make_tagging_message, make_tagging_prompt, build_context,
 )
 from mirror_reports import generate_report_html, parse_report_json
 from mirror_vision import (
-    extract_text_from_photo, start_edit_flow, get_pending,
+    extract_text_from_photo, extract_text_from_pdf,
+    start_edit_flow, get_pending, get_session, create_session,
     apply_correction, set_date, finish_edit_flow,
 )
 
@@ -95,12 +98,17 @@ def tag_entry(content):
         return 5, ["daily_life"]
 
     try:
+        # Build tagging prompt from config (dynamic topics + importance criteria)
+        tagging_prompt = make_tagging_prompt(
+            importance_criteria=memory.load_config("importance_criteria"),
+            topics=memory.get_topics(),
+        )
         response = claude.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=150,
             system=[{
                 "type": "text",
-                "text": TAGGING_PROMPT,
+                "text": tagging_prompt,
                 "cache_control": {"type": "ephemeral"},
             }],
             messages=[{"role": "user", "content": make_tagging_message(content)}],
@@ -417,21 +425,71 @@ async def handle_text(update, context):
 
 @authorized_only
 async def handle_photo(update, context):
-    """Receive photo -> OCR with Claude Vision -> start edit flow."""
+    """Receive photo -> OCR. Supports single photos and album mode."""
     if claude is None:
         await update.message.reply_text("Claude not configured. Cannot process photos.")
         return
 
     user_id = update.effective_user.id
+    media_group_id = update.message.media_group_id
 
-    # If there's already a pending OCR, warn
+    if media_group_id:
+        # -- Album mode: collect photos, OCR each, combine later --
+        session = get_session(user_id)
+        if session and session.media_group_id == media_group_id:
+            # Same album — just add this photo
+            pass
+        elif session and session.media_group_id != media_group_id:
+            # Different album while one is pending — warn
+            await update.message.reply_text(
+                "You have a pending entry. Send 'ok' to save it first."
+            )
+            return
+        else:
+            # New album session
+            session = create_session(user_id, session_type="album", media_group_id=media_group_id)
+
+        # Download and OCR this photo
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        image_bytes = await file.download_as_bytearray()
+
+        ocr_result, usage_info = extract_text_from_photo(claude, bytes(image_bytes))
+
+        if ocr_result:
+            session.add_page(ocr_result, usage_info, page_num=len(session.pages) + 1)
+            if usage_info:
+                memory.track_usage(
+                    input_tokens=usage_info["input_tokens"],
+                    output_tokens=usage_info["output_tokens"],
+                    cache_read_tokens=usage_info["cache_read_tokens"],
+                    cost_cents=usage_info["cost_cents"],
+                )
+        else:
+            logger.warning("OCR failed for album photo %d", len(session.pages) + 1)
+            memory.track_usage(is_error=True)
+
+        # Schedule/reschedule the album completion timer (2 seconds after last photo)
+        job_name = f"album_{user_id}"
+        current_jobs = context.application.job_queue.get_jobs_by_name(job_name)
+        for job in current_jobs:
+            job.schedule_removal()
+
+        context.application.job_queue.run_once(
+            album_collection_done,
+            when=2.0,
+            name=job_name,
+            data={"user_id": user_id, "chat_id": update.effective_chat.id},
+        )
+        return
+
+    # -- Single photo mode --
     if get_pending(user_id):
         await update.message.reply_text(
             "You have a pending OCR edit. Send 'ok' to save it first, or send a correction."
         )
         return
 
-    # Download the highest-resolution photo
     photo = update.message.photo[-1]
     file = await photo.get_file()
     image_bytes = await file.download_as_bytearray()
@@ -445,7 +503,6 @@ async def handle_photo(update, context):
         memory.track_usage(is_error=True)
         return
 
-    # Track OCR usage
     if usage_info:
         memory.track_usage(
             input_tokens=usage_info["input_tokens"],
@@ -454,7 +511,6 @@ async def handle_photo(update, context):
             cost_cents=usage_info["cost_cents"],
         )
 
-    # Start edit flow
     start_edit_flow(user_id, ocr_result, usage_info)
 
     confidence = ocr_result.get("confidence", "unknown")
@@ -472,10 +528,107 @@ async def handle_photo(update, context):
     logger.info("OCR complete (confidence=%s)", confidence)
 
 
+async def album_collection_done(context: ContextTypes.DEFAULT_TYPE):
+    """Fires 2s after last album photo — assembles all pages and shows for review."""
+    job_data = context.job.data
+    user_id = job_data["user_id"]
+    chat_id = job_data["chat_id"]
+
+    session = get_session(user_id)
+    if not session or session.session_type != "album":
+        return
+
+    if not session.pages:
+        await context.bot.send_message(chat_id=chat_id, text="Could not read any photos in the album.")
+        return
+
+    # Assemble all pages
+    session.assemble()
+
+    page_count = len(session.pages)
+    failed = page_count - len([p for p in session.pages if p.get("text")])
+
+    status = f"Read {page_count} pages"
+    if failed:
+        status += f" ({failed} failed)"
+
+    date_info = f"\nDate found: {session.combined_date}" if session.combined_date else "\nNo date found. Send a date (YYYY-MM-DD) to set one."
+    confidence_warning = ""
+    if session.combined_confidence == "low":
+        confidence_warning = "\n(Low confidence -- please review carefully)"
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{status}.{confidence_warning}\n\n"
+            f"{session.combined_text}"
+            f"{date_info}\n\n"
+            "Send 'ok' to save, send a date (YYYY-MM-DD), or reply with corrected text."
+        ),
+    )
+    logger.info("Album OCR complete: %d pages", page_count)
+
+
+@authorized_only
+async def handle_document(update, context):
+    """Receive PDF document -> extract text -> start edit flow."""
+    if claude is None:
+        await update.message.reply_text("Claude not configured. Cannot process documents.")
+        return
+
+    doc = update.message.document
+    if not doc or doc.mime_type != "application/pdf":
+        await update.message.reply_text("Only PDF documents are supported.")
+        return
+
+    user_id = update.effective_user.id
+    if get_pending(user_id):
+        await update.message.reply_text(
+            "You have a pending entry. Send 'ok' to save it first."
+        )
+        return
+
+    await update.message.reply_text("Reading document...")
+
+    file = await doc.get_file()
+    pdf_bytes = await file.download_as_bytearray()
+
+    ocr_result, usage_info = extract_text_from_pdf(claude, bytes(pdf_bytes))
+
+    if ocr_result is None:
+        await update.message.reply_text("Could not read the PDF. Try a different file.")
+        memory.track_usage(is_error=True)
+        return
+
+    if usage_info:
+        memory.track_usage(
+            input_tokens=usage_info["input_tokens"],
+            output_tokens=usage_info["output_tokens"],
+            cache_read_tokens=usage_info["cache_read_tokens"],
+            cost_cents=usage_info["cost_cents"],
+        )
+
+    # Create PDF session
+    session = create_session(user_id, session_type="pdf")
+    session.add_page(ocr_result, usage_info)
+    session.assemble()
+
+    date_info = f"\nDate found: {ocr_result.get('date')}" if ocr_result.get("date") else "\nNo date found. Send a date (YYYY-MM-DD) to set one."
+
+    await update.message.reply_text(
+        f"Here's what I extracted:\n\n"
+        f"{ocr_result.get('text', '')}"
+        f"{date_info}\n\n"
+        "Send 'ok' to save, send a date (YYYY-MM-DD), or reply with corrected text."
+    )
+    logger.info("PDF extraction complete")
+
+
 async def _save_ocr_entry(update, user_id, pending):
-    """Finalize and save an OCR entry."""
+    """Finalize and save an OCR entry (supports single, album, and PDF)."""
     data = finish_edit_flow(user_id)
     text = data["text"]
+    session = data.get("session")  # Full OCRSession for multi-page saves
 
     # Parse entry date
     entry_date = date.today()
@@ -485,11 +638,19 @@ async def _save_ocr_entry(update, user_id, pending):
         except ValueError:
             pass
 
-    # Save to entries table
+    # Determine entry type
+    entry_type = "journal_photo"
+    if session:
+        if session.session_type == "pdf":
+            entry_type = "journal_pdf"
+        elif session.session_type == "album":
+            entry_type = "journal_album"
+
+    # Save ONE entry to entries table
     entry_id = memory.save_entry(
         content=text,
         entry_date=entry_date,
-        entry_type="journal_photo",
+        entry_type=entry_type,
         telegram_message_id=update.message.message_id,
     )
 
@@ -501,19 +662,31 @@ async def _save_ocr_entry(update, user_id, pending):
     importance, topics = tag_entry(text)
     memory.update_entry_tags(entry_id, importance, topics)
 
-    # Save to journal_pages table
-    memory.save_journal_page(
-        entry_id=entry_id,
-        image_url=data.get("image_url"),
-        raw_ocr_text=text,
-        final_text=text,
-        entry_date=entry_date.isoformat(),
-        themes=topics,
-    )
+    # Save journal_pages — one per page for albums, one for single/PDF
+    if session and len(session.pages) > 1:
+        for page in session.pages:
+            memory.save_journal_page(
+                entry_id=entry_id,
+                image_url=page.get("image_url") or "",
+                raw_ocr_text=page.get("text", ""),
+                final_text=page.get("text", ""),
+                entry_date=entry_date.isoformat(),
+                themes=topics,
+            )
+    else:
+        memory.save_journal_page(
+            entry_id=entry_id,
+            image_url=data.get("image_url") or "",
+            raw_ocr_text=text,
+            final_text=text,
+            entry_date=entry_date.isoformat(),
+            themes=topics,
+        )
 
+    page_info = f", {len(session.pages)} pages" if session and len(session.pages) > 1 else ""
     await update.message.reply_text("Saved")
-    logger.info("OCR entry %s saved (date=%s, importance=%d, topics=%s)",
-                entry_id, entry_date, importance, topics)
+    logger.info("OCR entry %s saved (type=%s, date=%s, importance=%d, topics=%s%s)",
+                entry_id, entry_type, entry_date, importance, topics, page_info)
 
 
 @authorized_only
@@ -569,6 +742,7 @@ async def handle_help(update, context):
         "/rebuild - Rebuild profile from all entries\n"
         "/cost - Today's API usage\n"
         "/export - Download entries as JSON\n"
+        "/recall [date] - What happened on a date\n"
         "/schedule [HH:MM] [N] - Daily auto-questions\n"
         "/schedule off - Disable daily questions\n\n"
         "Photos: Send a journal page photo for OCR.\n"
@@ -902,6 +1076,110 @@ async def handle_report(update, context):
 
 
 @authorized_only
+async def handle_recall(update, context):
+    """Look up journal entries from a specific date or period.
+
+    Usage:
+        /recall 2026-03-17        -> entries from that date
+        /recall 17.03.2026        -> DD.MM.YYYY format
+        /recall last week         -> entries from last 7 days
+        /recall March 17          -> natural language
+    """
+    args_text = " ".join(context.args) if context.args else ""
+    if not args_text:
+        await update.message.reply_text(
+            "Usage: /recall <date or period>\n"
+            "Examples:\n"
+            "  /recall 2026-03-17\n"
+            "  /recall last week\n"
+            "  /recall March 17"
+        )
+        return
+
+    # Try parsing common date formats directly
+    from datetime import timedelta
+    start_date = None
+    end_date = None
+
+    # Try YYYY-MM-DD
+    try:
+        start_date = date.fromisoformat(args_text)
+        end_date = start_date
+    except ValueError:
+        pass
+
+    # Try DD.MM.YYYY or DD/MM/YYYY
+    if not start_date:
+        for fmt in ("%d.%m.%Y", "%d/%m/%Y"):
+            try:
+                start_date = datetime.strptime(args_text, fmt).date()
+                end_date = start_date
+                break
+            except ValueError:
+                continue
+
+    # Fall back to Claude for natural language parsing
+    if not start_date:
+        parse_prompt = (
+            f"Parse this date/period reference into exact dates. Today is {date.today().isoformat()}.\n"
+            f"Input: \"{args_text}\"\n"
+            f"Return JSON: {{\"start_date\": \"YYYY-MM-DD\", \"end_date\": \"YYYY-MM-DD\"}}\n"
+            f"For a single date, start_date = end_date. Return ONLY JSON."
+        )
+        parsed, _ = call_claude(parse_prompt, max_tokens=100)
+        if parsed:
+            try:
+                # Strip markdown fences
+                clean = parsed.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+                    if clean.endswith("```"):
+                        clean = clean[:-3]
+                    clean = clean.strip()
+                dates = json.loads(clean)
+                start_date = date.fromisoformat(dates["start_date"])
+                end_date = date.fromisoformat(dates["end_date"])
+            except (json.JSONDecodeError, KeyError, ValueError):
+                pass
+
+    if not start_date:
+        await update.message.reply_text("Could not parse that date. Try: /recall 2026-03-17")
+        return
+
+    # Query entries
+    if start_date == end_date:
+        entries = memory.get_entries_by_date(start_date)
+        date_range = start_date.isoformat()
+    else:
+        entries = memory.get_entries_in_range(start_date, end_date)
+        date_range = f"{start_date.isoformat()} to {end_date.isoformat()}"
+
+    if not entries:
+        await update.message.reply_text(f"No entries found for {date_range}.")
+        return
+
+    await update.message.reply_text(f"Found {len(entries)} entries for {date_range}. Summarizing...")
+
+    # Build context and call Claude
+    profile = memory.load_profile()
+    topics = memory.load_all_topics()
+    ctx = build_context(profile, topics)
+    formatted = memory._format_entries_for_prompt(entries)
+
+    prompt = RECALL_PROMPT.format(
+        context=ctx,
+        date_range=date_range,
+        entries=formatted,
+    )
+
+    text, _ = call_claude(prompt, max_tokens=1000)
+    if text:
+        await _send_ai_response(update, text, response_id=f"recall_{start_date.isoformat()}")
+    else:
+        await update.message.reply_text("Failed to generate summary. Check logs.")
+
+
+@authorized_only
 async def handle_rating_callback(update, context):
     """Handle thumbs up/down rating from inline keyboard."""
     query = update.callback_query
@@ -957,25 +1235,103 @@ async def weekly_self_review_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def monthly_improvement_job(context: ContextTypes.DEFAULT_TYPE):
-    """JobQueue callback: monthly improvement summary on 1st of each month."""
-    logger.info("Starting monthly improvement summary...")
-    text = memory.run_monthly_improvement(claude)
-    if text:
-        # Send to user via Telegram
-        MAX_LEN = 4000
-        if len(text) <= MAX_LEN:
-            await context.bot.send_message(
-                chat_id=AUTHORIZED_USER_ID,
-                text=f"Monthly Mirror Self-Review:\n\n{text}",
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=AUTHORIZED_USER_ID,
-                text=f"Monthly Mirror Self-Review:\n\n{text[:MAX_LEN]}",
-            )
-        logger.info("Monthly improvement summary sent to user")
-    else:
+    """JobQueue callback: monthly improvement with structured proposals."""
+    logger.info("Starting monthly improvement...")
+    summary, proposals = memory.run_monthly_improvement(claude)
+
+    if not summary and not proposals:
         logger.info("Monthly improvement skipped (no reviews)")
+        return
+
+    # Send summary
+    if summary:
+        await context.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text=f"Monthly Mirror Self-Review:\n\n{summary}",
+        )
+
+    if not proposals:
+        await context.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text="Everything looks good. No changes suggested this month.",
+        )
+        return
+
+    # Store proposals in bot_data for callback handling
+    if "improvement_proposals" not in context.bot_data:
+        context.bot_data["improvement_proposals"] = {}
+
+    # Send each proposal with approve/reject buttons
+    for p in proposals:
+        pid = p.get("id", f"p_{hash(p.get('title', ''))}")
+        context.bot_data["improvement_proposals"][pid] = p
+
+        can_auto_apply = p.get("config_key") is not None
+        action_note = "" if can_auto_apply else "\n(Requires dev session to implement)"
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Approve", callback_data=f"improve:approve:{pid}"),
+            InlineKeyboardButton("Reject", callback_data=f"improve:reject:{pid}"),
+        ]])
+
+        await context.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text=(
+                f"Proposal: {p.get('title', 'Untitled')}\n"
+                f"Category: {p.get('category', '?')}\n"
+                f"Reason: {p.get('reasoning', 'No reason given')}"
+                f"{action_note}"
+            ),
+            reply_markup=keyboard,
+        )
+
+    logger.info("Monthly improvement: %d proposals sent to user", len(proposals))
+
+
+async def handle_improvement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle approve/reject button presses for improvement proposals."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # "improve:approve:change_1" or "improve:reject:change_1"
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return
+
+    action = parts[1]  # "approve" or "reject"
+    pid = parts[2]     # proposal id
+
+    proposals = context.bot_data.get("improvement_proposals", {})
+    proposal = proposals.get(pid)
+
+    if not proposal:
+        await query.edit_message_text("Proposal not found or already processed.")
+        return
+
+    title = proposal.get("title", "Untitled")
+
+    if action == "approve":
+        config_key = proposal.get("config_key")
+        if config_key and proposal.get("proposed_value") is not None:
+            # Auto-apply config change
+            success = memory.apply_config_change(proposal)
+            if success:
+                await query.edit_message_text(f"Approved and applied: {title}")
+            else:
+                await query.edit_message_text(f"Approved but failed to apply: {title}")
+        else:
+            # Needs dev session
+            await query.edit_message_text(
+                f"Approved: {title}\n"
+                f"This will be applied in the next Claude Code session."
+            )
+        logger.info("Proposal approved: %s", title)
+    else:
+        await query.edit_message_text(f"Rejected: {title}")
+        logger.info("Proposal rejected: %s", title)
+
+    # Remove from pending proposals
+    proposals.pop(pid, None)
 
 
 # -- Error Handler ----------------------------------------------------
@@ -992,6 +1348,39 @@ async def error_handler(update, context):
 
 # -- Main -------------------------------------------------------------
 
+LOCK_FILE = os.path.join(PROJECT_ROOT, ".tmp", "mirror_bot.pid")
+
+
+def _acquire_lock():
+    """Prevent duplicate bot instances via PID lock file."""
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+
+    if os.path.exists(LOCK_FILE):
+        try:
+            old_pid = int(open(LOCK_FILE).read().strip())
+            # Check if that process is still running
+            os.kill(old_pid, 0)  # Doesn't kill -- just checks existence
+            print(f"ERROR: Mirror bot already running (PID {old_pid}).")
+            print(f"Kill it first:  taskkill /PID {old_pid} /F")
+            print(f"Or delete the lock file:  {LOCK_FILE}")
+            sys.exit(1)
+        except (OSError, ValueError):
+            # Process not running or bad PID -- stale lock, safe to overwrite
+            pass
+
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    def _release_lock(*_args):
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
+
+    atexit.register(_release_lock)
+    signal.signal(signal.SIGTERM, lambda *a: (_release_lock(), sys.exit(0)))
+
+
 def main():
     global memory, claude
 
@@ -999,6 +1388,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Use local SQLite instead of Supabase")
     args = parser.parse_args()
+
+    _acquire_lock()
 
     if not TELEGRAM_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN not set in .env")
@@ -1032,34 +1423,37 @@ def main():
     app.add_handler(CommandHandler("feedback", handle_feedback))
     app.add_handler(CommandHandler("insight", handle_insight))
     app.add_handler(CommandHandler("report", handle_report))
+    app.add_handler(CommandHandler("recall", handle_recall))
 
-    # Callback handler for ratings
+    # Callback handlers
     app.add_handler(CallbackQueryHandler(handle_rating_callback, pattern=r"^rate:"))
+    app.add_handler(CallbackQueryHandler(handle_improvement_callback, pattern=r"^improve:"))
 
     # Message handlers
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_error_handler(error_handler)
 
-    # Weekly profile rebuild -- every Sunday at 3:00 AM Malaysia time
+    # Weekly profile rebuild -- every Sunday at 8:00 PM Malaysia time
     user_tz = ZoneInfo("Asia/Kuala_Lumpur")
     app.job_queue.run_daily(
         weekly_rebuild_job,
-        time=time(hour=3, minute=0, tzinfo=user_tz),
+        time=time(hour=20, minute=0, tzinfo=user_tz),
         days=(6,),  # Sunday
         name="weekly_rebuild",
     )
-    logger.info("Weekly rebuild scheduled: Sundays at 03:00 Malaysia time")
+    logger.info("Weekly rebuild scheduled: Sundays at 20:00 Malaysia time")
 
-    # Weekly self-review -- every Sunday at 3:30 AM (after rebuild finishes)
+    # Weekly self-review -- every Sunday at 8:30 PM (after rebuild finishes)
     app.job_queue.run_daily(
         weekly_self_review_job,
-        time=time(hour=3, minute=30, tzinfo=user_tz),
+        time=time(hour=20, minute=30, tzinfo=user_tz),
         days=(6,),  # Sunday
         name="weekly_self_review",
     )
-    logger.info("Weekly self-review scheduled: Sundays at 03:30 Malaysia time")
+    logger.info("Weekly self-review scheduled: Sundays at 20:30 Malaysia time")
 
     # Monthly improvement -- 1st of each month at 9:00 AM
     app.job_queue.run_monthly(

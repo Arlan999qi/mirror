@@ -1,4 +1,5 @@
 """All Claude prompts for the Mirror bot."""
+import json
 
 # Anti-sycophancy system prompt -- used for /feedback, /insight, /question
 MIRROR_SYSTEM = """You are Mirror -- a personal advisor whose ONLY value is honesty.
@@ -31,7 +32,7 @@ TEMPORAL AWARENESS:
 - If old and new entries conflict, the new entry is the truth"""
 
 
-# Used after every journal entry to assign importance + topics
+# Default tagging prompt (used as fallback when config is unavailable)
 TAGGING_PROMPT = """You are a journal entry tagger. Given a journal entry, return a JSON object with:
 - "importance": integer 1-10 (1=mundane daily log, 5=notable thought/event, 10=life-changing revelation)
 - "topics": array of 1-3 topic tags from ONLY these categories: ["career", "relationships", "health", "education", "emotions", "finance", "daily_life", "goals"]
@@ -41,6 +42,28 @@ Scoring guide:
 - 4-6: reflections on work, relationship dynamics, health changes, moderate decisions
 - 7-8: significant realizations, major decisions, emotional breakthroughs
 - 9-10: life-changing events, core identity shifts, fundamental belief changes
+
+Return ONLY valid JSON. No explanation."""
+
+
+def make_tagging_prompt(importance_criteria=None, topics=None):
+    """Build tagging prompt with dynamic config values."""
+    if not importance_criteria and not topics:
+        return TAGGING_PROMPT
+    topics_list = topics or ["career", "relationships", "health", "education",
+                              "emotions", "finance", "daily_life", "goals"]
+    criteria = importance_criteria or (
+        "1-3: routine activities, weather, what I ate, small tasks. "
+        "4-6: reflections on work, relationship dynamics, health changes, moderate decisions. "
+        "7-8: significant realizations, major decisions, emotional breakthroughs. "
+        "9-10: life-changing events, core identity shifts, fundamental belief changes."
+    )
+    return f"""You are a journal entry tagger. Given a journal entry, return a JSON object with:
+- "importance": integer 1-10 (1=mundane daily log, 5=notable thought/event, 10=life-changing revelation)
+- "topics": array of 1-3 topic tags from ONLY these categories: {json.dumps(topics_list)}
+
+Scoring guide:
+{criteria}
 
 Return ONLY valid JSON. No explanation."""
 
@@ -225,19 +248,24 @@ RATINGS SUMMARY:
 ERROR LOG:
 {error_summary}
 
+CURRENT CONFIG:
+{config_summary}
+
 Analyze the past week and produce a concise review covering:
 1. USAGE PATTERNS: How actively is the user journaling? What times/days?
 2. AI QUALITY: Based on ratings (thumbs up/down), are AI responses meeting expectations?
 3. COST EFFICIENCY: Is token usage reasonable? Any cache optimization opportunities?
 4. ERRORS: Any recurring failures that need fixing?
-5. SUGGESTIONS: 1-3 specific, actionable improvements. Categorize each as:
-   - AUTO (safe to apply without approval): topic weight adjustments, cache tuning
-   - APPROVAL (needs user sign-off): prompt changes, feature additions, behavior changes
+5. SUGGESTIONS: 1-3 specific, actionable improvements as JSON array:
 
-Return as plain text, not JSON. Be concise -- this is an internal review, not a user-facing report."""
+```json
+[{{"category": "weights|topics|importance|prompts|features|memory", "title": "short title", "reasoning": "why"}}]
+```
+
+Return the review as plain text, with the suggestions JSON block at the end."""
 
 
-MONTHLY_IMPROVEMENT_PROMPT = """You are synthesizing the past month's weekly self-reviews for a personal journal bot called Mirror.
+MONTHLY_IMPROVEMENT_PROMPT = """You are the self-improvement engine for a personal journal bot called Mirror. Analyze the past month's data and propose concrete, actionable changes.
 
 WEEKLY REVIEWS:
 {reviews}
@@ -245,17 +273,68 @@ WEEKLY REVIEWS:
 OVERALL USAGE THIS MONTH:
 {monthly_usage}
 
-Produce a monthly improvement summary:
-1. TOP PATTERNS: What consistent themes emerged across weeks?
-2. WINS: What's working well? (high ratings, good engagement, low errors)
-3. PROBLEMS: What keeps failing or getting bad ratings?
-4. ACTION ITEMS: Prioritized list of improvements. For each:
-   - What to change
-   - Why (cite specific review evidence)
-   - Category: AUTO or APPROVAL
-5. COST TREND: Is spending stable, rising, or falling? Any optimization needed?
+CURRENT CONFIG:
+{config_summary}
 
-Keep it under 300 words. This gets sent directly to the user via Telegram."""
+TOPIC ENTRY COUNTS:
+{topic_counts}
+
+TIER 2 TOPIC SUMMARIES:
+{topic_summaries}
+
+RECENT ENTRIES SAMPLE (last 20):
+{recent_entries}
+
+Return a JSON object with this structure:
+```json
+{{
+  "proposed_changes": [
+    {{
+      "id": "change_1",
+      "category": "weights|topics|importance|prompts|features|memory|reports|usage",
+      "title": "Short human-readable title",
+      "reasoning": "Evidence-based reason citing specific data",
+      "config_key": "bot_config key to update (or null for features/prompts)",
+      "current_value": "current value if applicable",
+      "proposed_value": "new value if applicable"
+    }}
+  ],
+  "summary": "1-2 sentence overall assessment"
+}}
+```
+
+Categories:
+- weights: recency weight adjustments (config_key: recency_weights)
+- topics: add/merge/remove topic categories (config_key: topics)
+- importance: scoring criteria changes (config_key: importance_criteria)
+- prompts: improvements to system prompts (config_key: null, needs dev session)
+- features: new feature suggestions (config_key: null, needs dev session)
+- memory: rebuild limits, compaction quality (config_key: rebuild_limit)
+- reports: report format improvements (config_key: null, needs dev session)
+- usage: tips for the user on using the bot more effectively (config_key: null)
+
+Rules:
+- Only propose changes backed by data. No speculative suggestions.
+- For weights/topics/importance/memory: include config_key and proposed_value (these can be auto-applied).
+- For prompts/features/reports: set config_key to null (these need a dev session to implement).
+- Keep proposals to 3-7 items max. Quality over quantity.
+- Return ONLY the JSON object, no other text."""
+
+
+RECALL_PROMPT = """Based on the journal entries below and the user's profile, summarize what happened during this period.
+
+{context}
+
+ENTRIES FROM {date_range}:
+{entries}
+
+Provide a concise summary covering:
+- Key events, activities, and decisions
+- Emotional themes and mood patterns
+- Any notable insights or turning points
+- Connections to broader life patterns (if visible from profile)
+
+Be specific, cite content from entries. Keep it under 300 words."""
 
 
 def make_tagging_message(entry_text):
