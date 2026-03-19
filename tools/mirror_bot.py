@@ -362,7 +362,7 @@ async def handle_text(update, context):
 
     # -- OCR edit-before-save flow --
     if pending:
-        check_marks = {"v", "V", "ok", "OK", "Ok"}
+        check_marks = {"v", "V", "ok", "OK", "Ok", "save", "Save", "SAVE"}
         if text.strip() in check_marks:
             # User confirms OCR text as-is
             return await _save_ocr_entry(update, user_id, pending)
@@ -570,6 +570,12 @@ async def album_collection_done(context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized_only
+@authorized_only
+async def handle_unsupported_document(update, context):
+    """Reply to non-PDF documents."""
+    await update.message.reply_text("Only PDF documents are supported.")
+
+
 async def handle_document(update, context):
     """Receive PDF document -> extract text -> start edit flow."""
     if claude is None:
@@ -1432,6 +1438,7 @@ def main():
     # Message handlers
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.PDF, handle_unsupported_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_error_handler(error_handler)
