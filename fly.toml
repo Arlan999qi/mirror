@@ -1,0 +1,13 @@
+app = "mirror-journal-bot"
+primary_region = "sin"
+
+[build]
+
+[processes]
+  app = "python tools/mirror_bot.py"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = 256
+  auto_stop_machines = false
+  auto_start_machines = true

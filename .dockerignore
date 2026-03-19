@@ -1,0 +1,11 @@
+.env
+.git
+.claude
+.gitignore
+__pycache__
+*.pyc
+workflows/
+CLAUDE.md
+MIRROR_BUILD_PLAN.md
+.env.example
+.tmp/

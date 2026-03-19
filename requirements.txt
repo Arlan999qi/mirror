@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]
+supabase
+anthropic
+python-dotenv
