@@ -74,6 +74,10 @@ claude = None
 # {user_id: {"step": int, "total": int}}
 _onboarding = {}
 
+# -- Text message buffer (for combining split messages) ---------------
+# {user_id: {"parts": [str, ...], "message_ids": [int, ...]}}
+_text_buffer = {}
+
 
 # -- Authorization ----------------------------------------------------
 
@@ -455,23 +459,66 @@ async def handle_text(update, context):
         )
         return
 
-    # -- Normal text entry flow --
+    # -- Normal text entry flow (with buffer for split messages) --
+    buf = _text_buffer.get(user_id)
+    if buf:
+        # Append to existing buffer
+        buf["parts"].append(text)
+        buf["message_ids"].append(update.message.message_id)
+    else:
+        # Start new buffer
+        _text_buffer[user_id] = {
+            "parts": [text],
+            "message_ids": [update.message.message_id],
+        }
+
+    # Schedule/reschedule save timer (2 seconds after last part)
+    job_name = f"text_buffer_{user_id}"
+    current_jobs = context.application.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
+
+    context.application.job_queue.run_once(
+        _flush_text_buffer,
+        when=2.0,
+        name=job_name,
+        data={"user_id": user_id, "chat_id": update.effective_chat.id},
+    )
+
+
+async def _flush_text_buffer(context: ContextTypes.DEFAULT_TYPE):
+    """Save buffered text parts as a single entry after 2s of no new messages."""
+    user_id = context.job.data["user_id"]
+    chat_id = context.job.data["chat_id"]
+
+    buf = _text_buffer.pop(user_id, None)
+    if not buf or not buf["parts"]:
+        return
+
+    combined_text = "\n".join(buf["parts"])
+    first_message_id = buf["message_ids"][0]
+    part_count = len(buf["parts"])
+
     entry_id = memory.save_entry(
-        content=text,
+        content=combined_text,
         entry_date=date.today(),
         entry_type="text",
-        telegram_message_id=update.message.message_id,
+        telegram_message_id=first_message_id,
     )
 
     if entry_id is None:
-        await update.message.reply_text("Error saving entry. Check logs.")
+        await context.bot.send_message(chat_id=chat_id, text="Error saving entry. Check logs.")
         return
 
-    importance, topics = tag_entry(text)
+    importance, topics = tag_entry(combined_text)
     memory.update_entry_tags(entry_id, importance, topics)
 
-    await update.message.reply_text("Saved")
-    logger.info("Entry %s saved (importance=%d, topics=%s)", entry_id, importance, topics)
+    await context.bot.send_message(chat_id=chat_id, text="Saved")
+    if part_count > 1:
+        logger.info("Entry %s saved (%d parts combined, importance=%d, topics=%s)",
+                     entry_id, part_count, importance, topics)
+    else:
+        logger.info("Entry %s saved (importance=%d, topics=%s)", entry_id, importance, topics)
 
 
 @authorized_only
