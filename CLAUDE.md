@@ -63,7 +63,7 @@ tools/
   rebuild_profile.py   # Manual Tier 1 + Tier 2 rebuild
   run_self_review.py   # Manual weekly self-review trigger
 
-.claude/skills/        # 6 local skills (Telegram, PDF, memory, OCR, RAG)
+.claude/skills/        # mirror-dev-guide: patterns for extending the bot
 .tmp/                  # Disposable: fallback DB, reports, exports
 ```
 

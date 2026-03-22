@@ -91,14 +91,20 @@ Pick the most important thing they need to hear -- something they might not see 
 
 
 # Used for /question command
-QUESTION_PROMPT = """Based on everything you know about this person (profile and topic summaries below), generate {n} personalized journal question(s) that would help them think deeper.
+QUESTION_PROMPT = """Based on everything you know about this person (profile, topic summaries, and recent entries below), generate {n} personalized journal question(s) that would help them think deeper.
 
 {context}
 
+{recent_entries_section}
+
+{recent_questions_section}
+
 Requirements:
-- Questions should target blind spots, contradictions, or areas they haven't explored
+- Questions MUST connect to their recent entries and latest life events, changes, or reflections
+- Target blind spots, contradictions, or areas they haven't explored
 - Each question should be specific to THEM, not generic
 - Questions should be answerable in 2-5 sentences
+- Questions must be DIFFERENT from any previously asked questions listed above
 - Return ONLY the questions, one per line, numbered"""
 
 

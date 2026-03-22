@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import anthropic
 from supabase import create_client, Client
@@ -438,6 +438,40 @@ class MirrorMemory:
             return result.count or 0
         except Exception:
             return 0
+
+    # -- Daily Questions --------------------------------------------------
+
+    def save_daily_questions(self, questions):
+        """Save generated questions to daily_questions table.
+
+        Args:
+            questions: list of question strings
+        """
+        if self._using_sqlite:
+            return
+        try:
+            rows = [{"question": q, "category": "daily"} for q in questions]
+            self.sb.table("daily_questions").insert(rows).execute()
+            logger.info("Saved %d daily questions", len(questions))
+        except Exception as e:
+            logger.error("Failed to save daily questions: %s", e)
+
+    def get_recent_questions(self, days=14):
+        """Get questions asked in the last N days to avoid repeats."""
+        if self._using_sqlite:
+            return []
+        try:
+            cutoff = (datetime.now(timezone.utc) -
+                      timedelta(days=days)).isoformat()
+            result = (self.sb.table("daily_questions")
+                      .select("question, asked_at")
+                      .gte("asked_at", cutoff)
+                      .order("asked_at", desc=True)
+                      .execute())
+            return [row["question"] for row in (result.data or [])]
+        except Exception as e:
+            logger.error("Failed to get recent questions: %s", e)
+            return []
 
     def track_usage(self, input_tokens=0, output_tokens=0, cache_read_tokens=0,
                     cost_cents=0, is_entry=False, rating=None, is_error=False):

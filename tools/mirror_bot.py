@@ -148,7 +148,11 @@ def tag_entry(content):
 # -- Daily Questions --------------------------------------------------
 
 def generate_questions(n=1):
-    """Use Claude to generate personalized journal questions."""
+    """Use Claude to generate personalized journal questions.
+
+    Includes recent entries and previously asked questions to ensure
+    questions are fresh, relevant, and never repeated.
+    """
     if claude is None:
         return None
 
@@ -156,7 +160,35 @@ def generate_questions(n=1):
     topics = memory.load_all_topics()
     context = build_context(profile, topics)
 
-    prompt = QUESTION_PROMPT.format(n=n, context=context)
+    # Include recent entries so questions connect to latest events
+    recent = memory.get_recent_entries(limit=15)
+    if recent:
+        entry_lines = []
+        for e in recent:
+            d = e.get("entry_date", "unknown")
+            content = e.get("content", "")
+            entry_lines.append(f"[{d}] {content}")
+        recent_entries_section = (
+            "=== RECENT ENTRIES (last 15) ===\n" + "\n---\n".join(entry_lines)
+        )
+    else:
+        recent_entries_section = ""
+
+    # Include recently asked questions to avoid repeats
+    past_questions = memory.get_recent_questions(days=30)
+    if past_questions:
+        recent_questions_section = (
+            "=== PREVIOUSLY ASKED QUESTIONS (do NOT repeat these) ===\n"
+            + "\n".join(f"- {q}" for q in past_questions)
+        )
+    else:
+        recent_questions_section = ""
+
+    prompt = QUESTION_PROMPT.format(
+        n=n, context=context,
+        recent_entries_section=recent_entries_section,
+        recent_questions_section=recent_questions_section,
+    )
 
     try:
         response = claude.messages.create(
@@ -178,6 +210,15 @@ def generate_questions(n=1):
             cost_cents=cost_cents,
         )
 
+        # Save generated questions to DB so they won't be repeated
+        questions = [
+            line.lstrip("0123456789.) ").strip()
+            for line in text.strip().splitlines()
+            if line.strip()
+        ]
+        if questions:
+            memory.save_daily_questions(questions)
+
         return text
 
     except Exception as e:
@@ -187,8 +228,18 @@ def generate_questions(n=1):
 
 
 async def daily_question_job(context: ContextTypes.DEFAULT_TYPE):
-    """JobQueue callback: send daily questions to the user."""
+    """JobQueue callback: rebuild profile then send daily questions."""
     n = context.job.data or 1
+
+    # Rebuild profile + topics daily so questions reflect latest state
+    logger.info("Daily pre-question profile rebuild starting...")
+    profile = memory.rebuild_profile(claude)
+    topics = memory.rebuild_topic_summaries(claude)
+    if profile:
+        logger.info("Daily profile rebuild done: %d topics", len(topics))
+    else:
+        logger.warning("Daily profile rebuild failed, using existing profile")
+
     text = generate_questions(n)
     if text:
         await context.bot.send_message(chat_id=AUTHORIZED_USER_ID, text=text)
@@ -964,11 +1015,7 @@ async def handle_question(update, context):
         )
         return
 
-    topics = memory.load_all_topics()
-    ctx = build_context(profile, topics)
-    prompt = QUESTION_PROMPT.format(n=n, context=ctx)
-
-    text, _ = call_claude(prompt, max_tokens=500)
+    text = generate_questions(n)
     if text:
         await _send_ai_response(update, text)
         logger.info("Generated %d question(s)", n)
